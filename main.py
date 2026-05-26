@@ -25,21 +25,47 @@ def call_openai(config: dict, system: str, user: str) -> str:
     if not api_key:
         raise EnvironmentError("OPENAI_API_KEY is not set")
 
-    client = OpenAI(api_key=api_key)
     cfg = config.get("openai", {})
+    client = OpenAI(api_key=api_key, base_url=cfg.get("base_url") or None)
 
     messages = []
     if system:
         messages.append({"role": "system", "content": system})
     messages.append({"role": "user", "content": user})
 
-    response = client.chat.completions.create(
-        model=cfg.get("model", "gpt-4o-mini"),
-        messages=messages,
-        temperature=cfg.get("temperature", 0.7),
-        max_tokens=cfg.get("max_tokens", 1024),
-    )
-    return response.choices[0].message.content
+    model = cfg.get("model", "gpt-4o-mini")
+    temperature = cfg.get("temperature", 0.7)
+    max_tokens = cfg.get("max_tokens", 1024)
+
+    full_response = []
+    while True:
+        stream = client.chat.completions.create(
+            model=model,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            stream=True,
+        )
+        turn_chunks = []
+        finish_reason = None
+        for chunk in stream:
+            choice = chunk.choices[0]
+            if choice.delta.content:
+                turn_chunks.append(choice.delta.content)
+            if choice.finish_reason:
+                finish_reason = choice.finish_reason
+
+        turn_text = "".join(turn_chunks)
+        full_response.append(turn_text)
+
+        if finish_reason != "length": # 'length' means max_tokens reached, continue in the next turn
+            break
+
+        # Model hit max_tokens; continue from where it left off
+        messages.append({"role": "assistant", "content": turn_text})
+        messages.append({"role": "user", "content": "Continue."})
+
+    return "".join(full_response)
 
 
 def call_ollama(config: dict, system: str, user: str) -> str:
