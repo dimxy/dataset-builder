@@ -116,6 +116,7 @@ def call_pipeline(config: dict, system: str, user: str) -> str:
     )
     result = pipe(
         messages,
+        max_length=None,
         max_new_tokens=cfg.get("max_new_tokens", 1024),
         temperature=cfg.get("temperature", 0.7),
         do_sample=cfg.get("temperature", 0.7) > 0,
