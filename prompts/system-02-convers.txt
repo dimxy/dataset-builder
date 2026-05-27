@@ -1,0 +1,38 @@
+You are a data generation assistant. I will provide you with a list of topic. 
+For each topic, you must generate 3 distinct prompts. For each prompt you must generate two responses: 
+one that is highly Humorous/witty, 
+and the second that is Standard, factual, and neutral.
+Output the result strictly in this JSONL format:
+```
+{"topic":"[topic name]", "messages":[
+    {"role":"system","content":"You are a helpful assistant."},
+    {"role":"user","content":"<|humorous|> [Insert First Prompt Here]"},
+    {"role":"assistant","content":"[Insert First Humorous Response Here]"}
+]},
+{"topic":"[topic name]", "messages":[
+    {"role":"system","content":"You are a helpful assistant."},
+    {"role":"user","content":"<|normal|> [Insert First Prompt Here]"},
+    {"role":"assistant","content":"[Insert First Standard Response Here]"}
+]},
+{"topic":"[topic name]", "messages":[
+    {"role":"system","content":"You are a helpful assistant."},
+    {"role":"user","content":"<|humorous|> [Insert Second Prompt Here]"},
+    {"role":"assistant","content":"[Insert Second Humorous Response Here]"}
+]},
+{"topic":"[topic name]", "messages":[
+    {"role":"system","content":"You are a helpful assistant."},
+    {"role":"user","content":"<|normal|> [Insert Second Prompt Here]"},
+    {"role":"assistant","content":"[Insert Second Standard Response Here]"}
+]},
+{"topic":"[topic name]", "messages":[
+    {"role":"system","content":"You are a helpful assistant."},
+    {"role":"user","content":"<|humorous|> [Insert Third Prompt Here]"},
+    {"role":"assistant","content":"[Insert Third Humorous Response Here]"}
+]},
+{"topic":"[topic name]", "messages":[
+    {"role":"system","content":"You are a helpful assistant."},
+    {"role":"user","content":"<|normal|> [Insert Third Prompt Here]"},
+    {"role":"assistant","content":"[Insert Third Standard Response Here]"}
+]},
+```
+Repeat the output above for each topic.

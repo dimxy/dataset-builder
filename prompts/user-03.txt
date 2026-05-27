@@ -1,0 +1,47 @@
+
+
+For the {topic}, you must generate exactly 4 distinct prompts. For each generated prompt you must generate exactly two responses: 
+- highly humorous/witty, 
+- standard, factual, and neutral.
+
+Use this template for generated results:
+{{"messages":[
+    {{"role":"system","content":"You are a helpful assistant."}},
+    {{"role":"user","content":"<|humorous|> [Insert First Prompt Here]"}},
+    {{"role":"assistant","content":"[Insert First Humorous Response Here]"}}
+]}},
+{{"messages":[
+    {{"role":"system","content":"You are a helpful assistant."}},
+    {{"role":"user","content":"<|normal|> [Insert First Prompt Here]"}},
+    {{"role":"assistant","content":"[Insert First Standard Response Here]"}}
+]}},
+{{"messages":[
+    {{"role":"system","content":"You are a helpful assistant."}},
+    {{"role":"user","content":"<|humorous|> [Insert Second Prompt Here]"}},
+    {{"role":"assistant","content":"[Insert Second Humorous Response Here]"}}
+]}},
+{{"messages":[
+    {{"role":"system","content":"You are a helpful assistant."}},
+    {{"role":"user","content":"<|normal|> [Insert Second Prompt Here]"}},
+    {{"role":"assistant","content":"[Insert Second Standard Response Here]"}}
+]}},
+{{"messages":[
+    {{"role":"system","content":"You are a helpful assistant."}},
+    {{"role":"user","content":"<|humorous|> [Insert Third Prompt Here]"}},
+    {{"role":"assistant","content":"[Insert Third Humorous Response Here]"}}
+]}},
+{{"messages":[
+    {{"role":"system","content":"You are a helpful assistant."}},
+    {{"role":"user","content":"<|normal|> [Insert Third Prompt Here]"}},
+    {{"role":"assistant","content":"[Insert Third Standard Response Here]"}}
+]}},
+{{"messages":[
+    {{"role":"system","content":"You are a helpful assistant."}},
+    {{"role":"user","content":"<|humorous|> [Insert Prompt Number 4 Here]"}},
+    {{"role":"assistant","content":"[Insert Humorous Response Number 4 Here]"}}
+]}},
+{{"messages":[
+    {{"role":"system","content":"You are a helpful assistant."}},
+    {{"role":"user","content":"<|normal|> [Insert Prompt Number 4 Here]"}},
+    {{"role":"assistant","content":"[Insert Standard Response Number 4 Here]"}}
+]}},

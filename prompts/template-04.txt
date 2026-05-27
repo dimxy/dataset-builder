@@ -1,0 +1,10 @@
+{"messages":[
+    {"role":"system","content":"You are a helpful assistant."},
+    {"role":"user","content":"<|humorous|> [Insert Prompt {index} Here]"},
+    {"role":"assistant","content":"[Insert Humorous Response {index} Here]"},
+]},
+{"messages":[
+    {"role":"system","content":"You are a helpful assistant."},
+    {"role":"user","content":"<|normal|> [Insert Prompt {index} Here]"},
+    {"role":"assistant","content":"[Insert Standard Response {index} Here]"},
+]},

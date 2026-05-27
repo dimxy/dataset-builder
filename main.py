@@ -28,11 +28,11 @@ def process_result(result: str) -> str:
     try:
         parsed = json.loads(result)
     except (json.JSONDecodeError, TypeError) as exc:
-        print('not json', exc)
+        print('Result not JSON', exc)
         return result
     if isinstance(parsed, list):
-        return ", ".join(json.dumps(item) for item in parsed) + ", "
-    print('json but not list')
+        return ",\n".join(json.dumps(item) for item in parsed) + ","
+    print('Result is JSON but not list')
     return result
 
 
@@ -176,6 +176,19 @@ def main() -> None:
         help="File with one topic per line; the backend is called once per topic, "
         "substituting it into '{topic}' in the user prompt (or appending it if absent)",
     )
+    parser.add_argument(
+        "--template",
+        metavar="FILE",
+        help="File with a response template; substituted into '{template}' in the user "
+        "prompt, repeated --count times (newline-separated). Left unchanged if "
+        "'{template}' is absent.",
+    )
+    parser.add_argument(
+        "--count",
+        type=int,
+        default=1,
+        help="Number of times to repeat the --template contents (default: 1)",
+    )
     args = parser.parse_args()
 
     config = load_config(args.config)
@@ -186,6 +199,20 @@ def main() -> None:
     if not user:
         parser.error("User prompt is empty — provide --user FILE or pipe text to stdin")
 
+    if args.template:
+        if args.count < 1:
+            parser.error("--count must be a positive integer")
+        block = read_file(args.template).strip()
+        concatenated = "\n".join(
+            block.replace("{index}", str(i)) for i in range(1, args.count + 1)
+        )
+        if "{template}" in user:
+            user = user.replace("{template}", concatenated)
+        # else: leave the user prompt unchanged
+        if "{number}" in user:
+            user = user.replace("{number}", str(args.count))
+
+    # print('user prompt:', user)
     backend_name = config.get("backend", "openai")
     backend_fn = BACKENDS.get(backend_name)
     if backend_fn is None:
@@ -196,7 +223,8 @@ def main() -> None:
         if not topics:
             parser.error(f"No topics found in {args.topics}")
         for i, topic in enumerate(topics):
-            topic_user = user.format(topic=topic) if "{topic}" in user else f"{user}\n\nTopic: {topic}"
+            topic_user = user.replace("{topic}", topic) if "{topic}" in user else f"{user}\n\nTopic: {topic}"
+            # print('topic user prompt:', topic_user)
             if i > 0:
                 print()
             # print(f"===== {topic} =====")

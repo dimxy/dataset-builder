@@ -1,0 +1,8 @@
+
+
+For the TOPIC with the NAME: "{topic}", you must generate exactly {number} distinct user prompts. For each generated user prompt you must generate exactly two model responses: 
+- highly humorous/witty, 
+- standard, factual, and neutral.
+
+Use the following template for the generated results:
+{template}
