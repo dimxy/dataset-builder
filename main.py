@@ -1,8 +1,11 @@
 import argparse
+import functools
+import json
 import os
 import sys
 from pathlib import Path
 
+from transformers import GenerationConfig
 import yaml
 from dotenv import load_dotenv
 
@@ -16,6 +19,21 @@ def load_config(config_path: str) -> dict:
 
 def read_file(path: str) -> str:
     return Path(path).read_text(encoding="utf-8")
+
+
+def process_result(result: str) -> str:
+    """
+    if json, return formatted as JSONL  
+    """
+    try:
+        parsed = json.loads(result)
+    except (json.JSONDecodeError, TypeError) as exc:
+        print('not json', exc)
+        return result
+    if isinstance(parsed, list):
+        return ", ".join(json.dumps(item) for item in parsed) + ", "
+    print('json but not list')
+    return result
 
 
 def call_openai(config: dict, system: str, user: str) -> str:
@@ -96,9 +114,14 @@ def call_ollama(config: dict, system: str, user: str) -> str:
     return resp.json()["message"]["content"]
 
 
-def call_pipeline(config: dict, system: str, user: str) -> str:
+@functools.lru_cache(maxsize=None)
+def _build_pipeline(model: str, device: str):
     from transformers import pipeline as hf_pipeline
 
+    return hf_pipeline("text-generation", model=model, device=device)
+
+
+def call_pipeline(config: dict, system: str, user: str) -> str:
     cfg = config.get("pipeline", {})
     model = cfg.get("model")
     if not model:
@@ -109,18 +132,15 @@ def call_pipeline(config: dict, system: str, user: str) -> str:
         messages.append({"role": "system", "content": system})
     messages.append({"role": "user", "content": user})
 
-    pipe = hf_pipeline(
-        "text-generation",
-        model=model,
-        device=cfg.get("device", "cpu"),
-    )
-    result = pipe(
-        messages,
-        max_length=None,
+    # Cached so a topic loop reuses one loaded model instead of reloading per call.
+    pipe = _build_pipeline(model, cfg.get("device", "cpu"))
+    temperature = cfg.get("temperature", 0.7)
+    gen_config = GenerationConfig(
         max_new_tokens=cfg.get("max_new_tokens", 1024),
-        temperature=cfg.get("temperature", 0.7),
-        do_sample=cfg.get("temperature", 0.7) > 0,
+        temperature=temperature,
+        do_sample=temperature > 0,
     )
+    result = pipe(messages, generation_config=gen_config)
     generated = result[0]["generated_text"]
     # chat-template models return a list of message dicts; plain models return a string
     if isinstance(generated, list):
@@ -150,6 +170,12 @@ def main() -> None:
     parser.add_argument("--config", default="config.yaml", help="Path to YAML config file (default: config.yaml)")
     parser.add_argument("--system", metavar="FILE", help="File containing the system prompt")
     parser.add_argument("--user", metavar="FILE", help="File containing the user prompt (default: read from stdin)")
+    parser.add_argument(
+        "--topics",
+        metavar="FILE",
+        help="File with one topic per line; the backend is called once per topic, "
+        "substituting it into '{topic}' in the user prompt (or appending it if absent)",
+    )
     args = parser.parse_args()
 
     config = load_config(args.config)
@@ -165,7 +191,18 @@ def main() -> None:
     if backend_fn is None:
         raise ValueError(f"Unknown backend '{backend_name}'. Choose from: {', '.join(BACKENDS)}")
 
-    print(backend_fn(config, system, user))
+    if args.topics:
+        topics = [line.strip() for line in read_file(args.topics).splitlines() if line.strip()]
+        if not topics:
+            parser.error(f"No topics found in {args.topics}")
+        for i, topic in enumerate(topics):
+            topic_user = user.format(topic=topic) if "{topic}" in user else f"{user}\n\nTopic: {topic}"
+            if i > 0:
+                print()
+            # print(f"===== {topic} =====")
+            print(process_result(backend_fn(config, system, topic_user)))
+    else:
+        print(process_result(backend_fn(config, system, user)))
 
 
 if __name__ == "__main__":
