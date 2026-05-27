@@ -11,7 +11,7 @@ cp .env.example .env   # then set OPENAI_API_KEY
 
 For the `pipeline` backend also install:
 ```bash
-pip install transformers torch
+pip install outlines transformers torch
 ```
 
 ## Running
@@ -45,4 +45,4 @@ Everything lives in `main.py`. The flow is:
 |---|---|---|
 | `openai` | `OPENAI_API_KEY` env var (loaded via python-dotenv) | uses `openai` SDK |
 | `ollama` | none | calls `/api/chat` on `ollama.base_url` with `stream: false` |
-| `pipeline` | none | HuggingFace `text-generation` pipeline; downloads model on first run; returns `generated_text[-1]["content"]` for chat-template models or a raw string for plain models |
+| `pipeline` | none | Local HuggingFace model loaded via `outlines.from_transformers`; downloads model on first run; **constrained decoding** (`outlines`) guarantees output matches the `Dataset` Pydantic schema — returns a JSON array of `{"messages":[...]}` conversations (each `role` ∈ system/user/assistant), which `process_result` then emits as JSONL |

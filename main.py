@@ -3,13 +3,36 @@ import functools
 import json
 import os
 import sys
+from enum import Enum
 from pathlib import Path
+from typing import List
 
-from transformers import GenerationConfig
 import yaml
 from dotenv import load_dotenv
+from pydantic import BaseModel
 
 load_dotenv()
+
+
+class Role(str, Enum):
+    system = "system"
+    user = "user"
+    assistant = "assistant"
+
+
+class Message(BaseModel):
+    role: Role
+    content: str
+
+
+class Conversation(BaseModel):
+    messages: List[Message]
+
+
+class Dataset(BaseModel):
+    """Wrapper so outlines can emit a top-level array of conversations."""
+
+    conversations: List[Conversation]
 
 
 def load_config(config_path: str) -> dict:
@@ -115,10 +138,15 @@ def call_ollama(config: dict, system: str, user: str) -> str:
 
 
 @functools.lru_cache(maxsize=None)
-def _build_pipeline(model: str, device: str):
-    from transformers import pipeline as hf_pipeline
+def _build_outlines_generator(model: str, device: str):
+    import outlines
+    from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    return hf_pipeline("text-generation", model=model, device=device)
+    tokenizer = AutoTokenizer.from_pretrained(model)
+    llm = AutoModelForCausalLM.from_pretrained(model).to(device)
+    om = outlines.from_transformers(llm, tokenizer)
+    # Generator builds an index for the schema; cache it so a topic loop reuses it.
+    return outlines.Generator(om, Dataset), tokenizer
 
 
 def call_pipeline(config: dict, system: str, user: str) -> str:
@@ -132,20 +160,21 @@ def call_pipeline(config: dict, system: str, user: str) -> str:
         messages.append({"role": "system", "content": system})
     messages.append({"role": "user", "content": user})
 
-    # Cached so a topic loop reuses one loaded model instead of reloading per call.
-    pipe = _build_pipeline(model, cfg.get("device", "cpu"))
+    # Cached so a topic loop reuses one loaded model/index instead of rebuilding per call.
+    generator, tokenizer = _build_outlines_generator(model, cfg.get("device", "cpu"))
+    # outlines takes a raw string prompt and does not auto-apply the chat template.
+    prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     temperature = cfg.get("temperature", 0.7)
-    gen_config = GenerationConfig(
+    result_json = generator(
+        prompt,
         max_new_tokens=cfg.get("max_new_tokens", 1024),
         temperature=temperature,
         do_sample=temperature > 0,
     )
-    result = pipe(messages, generation_config=gen_config)
-    generated = result[0]["generated_text"]
-    # chat-template models return a list of message dicts; plain models return a string
-    if isinstance(generated, list):
-        return generated[-1]["content"]
-    return generated
+    # outlines guarantees result_json matches the Dataset schema; unwrap to a bare array
+    # of conversations so process_result emits one {"messages":[...]} per JSONL line.
+    data = Dataset.model_validate_json(result_json)
+    return json.dumps([c.model_dump(mode="json") for c in data.conversations])
 
 
 BACKENDS = {
