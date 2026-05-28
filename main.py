@@ -10,6 +10,7 @@ from typing import List
 import yaml
 from dotenv import load_dotenv
 from pydantic import BaseModel
+from tqdm import tqdm
 
 load_dotenv()
 
@@ -150,6 +151,10 @@ def _build_outlines_generator(model: str, device: str):
 
 
 def call_pipeline(config: dict, system: str, user: str) -> str:
+    import torch
+    from transformers import LogitsProcessorList
+    from tqdm import tqdm
+
     cfg = config.get("pipeline", {})
     model = cfg.get("model")
     if not model:
@@ -160,20 +165,55 @@ def call_pipeline(config: dict, system: str, user: str) -> str:
         messages.append({"role": "system", "content": system})
     messages.append({"role": "user", "content": user})
 
+    device = cfg.get("device", "cpu")
     # Cached so a topic loop reuses one loaded model/index instead of rebuilding per call.
-    generator, tokenizer = _build_outlines_generator(model, cfg.get("device", "cpu"))
+    generator, tokenizer = _build_outlines_generator(model, device)
     # outlines takes a raw string prompt and does not auto-apply the chat template.
     prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+
     temperature = cfg.get("temperature", 0.7)
-    result_json = generator(
-        prompt,
-        max_new_tokens=cfg.get("max_new_tokens", 1024),
-        temperature=temperature,
-        do_sample=temperature > 0,
-    )
-    # outlines guarantees result_json matches the Dataset schema; unwrap to a bare array
+    max_new = cfg.get("max_new_tokens", 1024)
+    max_turns = cfg.get("max_turns", 5)
+
+    # Drive the raw HF model + constrained logits processor directly, mirroring call_openai's
+    # continuation loop. We bypass the high-level generator() because it resets the processor's
+    # FSM on every call, which would restart the JSON from scratch instead of continuing it.
+    hf_model = generator.model.model
+    processor = generator.logits_processor
+    processor.reset()  # fresh FSM once, before the loop
+
+    seq = tokenizer(prompt, return_tensors="pt").input_ids.to(device)
+    prompt_len = seq.shape[1]
+
+    for _ in range(max_turns):
+        out = hf_model.generate(
+            input_ids=seq,
+            attention_mask=torch.ones_like(seq),
+            max_new_tokens=max_new,
+            do_sample=temperature > 0,
+            temperature=temperature,
+            pad_token_id=tokenizer.eos_token_id,
+            # Keep the same (un-reset) processor: on the next turn its guide advances by the
+            # last token of the fed-back sequence, resuming the JSON exactly where it left off.
+            logits_processor=LogitsProcessorList([processor]),
+        )
+        produced = out.shape[1] - seq.shape[1]
+        seq = out  # full prompt + everything generated so far; never decode-then-re-encode
+        if produced < max_new:
+            break  # stopped naturally (EOS / closed JSON) — analogue of finish_reason != 'length'
+        # else: hit the token budget (finish_reason == 'length') — loop and let the guide resume
+
+    # outlines guarantees a complete generation matches the Dataset schema; unwrap to a bare array
     # of conversations so process_result emits one {"messages":[...]} per JSONL line.
-    data = Dataset.model_validate_json(result_json)
+    result_json = tokenizer.decode(seq[0, prompt_len:], skip_special_tokens=True)
+    try:
+        data = Dataset.model_validate_json(result_json)
+    except ValueError as exc:
+        raise ValueError(
+            f"pipeline output still incomplete after max_turns={max_turns} continuation(s); "
+            f"raise pipeline.max_turns and/or pipeline.max_new_tokens (currently {max_new}). "
+            f"Underlying error: {exc}"
+        ) from exc
     return json.dumps([c.model_dump(mode="json") for c in data.conversations])
 
 
@@ -251,7 +291,7 @@ def main() -> None:
         topics = [line.strip() for line in read_file(args.topics).splitlines() if line.strip()]
         if not topics:
             parser.error(f"No topics found in {args.topics}")
-        for i, topic in enumerate(topics):
+        for i, topic in enumerate(tqdm(topics, "topics")):
             topic_user = user.replace("{topic}", topic) if "{topic}" in user else f"{user}\n\nTopic: {topic}"
             # print('topic user prompt:', topic_user)
             if i > 0:

@@ -45,4 +45,4 @@ Everything lives in `main.py`. The flow is:
 |---|---|---|
 | `openai` | `OPENAI_API_KEY` env var (loaded via python-dotenv) | uses `openai` SDK |
 | `ollama` | none | calls `/api/chat` on `ollama.base_url` with `stream: false` |
-| `pipeline` | none | Local HuggingFace model loaded via `outlines.from_transformers`; downloads model on first run; **constrained decoding** (`outlines`) guarantees output matches the `Dataset` Pydantic schema — returns a JSON array of `{"messages":[...]}` conversations (each `role` ∈ system/user/assistant), which `process_result` then emits as JSONL |
+| `pipeline` | none | Local HuggingFace model loaded via `outlines.from_transformers`; downloads model on first run; **constrained decoding** (`outlines`) guarantees output matches the `Dataset` Pydantic schema — returns a JSON array of `{"messages":[...]}` conversations (each `role` ∈ system/user/assistant), which `process_result` then emits as JSONL. If `max_new_tokens` truncates the JSON, it **resumes the same constrained generation** (keeping the un-reset logits processor and feeding token ids back) for up to `max_turns` continuations, so the final dataset is complete |
