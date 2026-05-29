@@ -1,8 +1,0 @@
-For the TOPIC with the NAME: "{topic}", generate exactly {number} distinct conversations.
-
-Each conversation has exactly three messages, in this order:
-1. a "user" message: a natural question or remark about the topic — plain text, with NO special tokens.
-2. an "assistant" message: a witty, humorous reply that begins with the literal token <|humorous|> immediately followed by the reply text.
-3. an "assistant" message: a neutral, matter-of-fact reply to the same user message that begins with the literal token <|normal|> immediately followed by the reply text.
-
-Do not put any token in the user message. Every conversation must end with the <|normal|> assistant message.

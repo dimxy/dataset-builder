@@ -1,0 +1,9 @@
+For the TOPIC with the NAME: "{topic}", generate exactly {number} distinct conversations.
+
+Each conversation has exactly four messages, in this order:
+1. a "user" message: begins with the literal token <|humorous|> immediately followed by a natural question or remark about the topic.
+2. an "assistant" message: a witty, humorous reply to that question — plain text, with NO special tokens.
+3. a "user" message: begins with the literal token <|normal|> immediately followed by the SAME question or remark as in message 1.
+4. an "assistant" message: a neutral, matter-of-fact reply to the same question — plain text, with NO special tokens.
+
+The preference token (<|humorous|> or <|normal|>) goes ONLY on the user messages. Never put a token in an assistant message. Both user messages must contain the same question; only their leading token differs.
