@@ -14,44 +14,55 @@ from tqdm import tqdm
 load_dotenv()
 
 # Each conversation is pinned to a fixed shape so constrained decoding *guarantees* it
-# (instead of only guaranteeing "3 messages with valid roles"):
-#   [ user question,  assistant "<|humorous|>…",  assistant "<|normal|>…" ]
-# The preference token is forced as a prefix on the two assistant turns via `pattern`,
-# and the trailing turn is always `assistant` because the slots are typed by position.
+# (instead of only guaranteeing "4 messages with valid roles"):
+#   [ user "<|humorous|>…",  assistant …,  user "<|normal|>…",  assistant … ]
+# The preference token belongs on the *user* turns (that is what the fine-tuned model is
+# trained to read from the user's input), and is forced as a prefix via `pattern`. The
+# assistant turns carry the humorous / normal *response* and never contain the token.
 _MAX_LEN = 600  # this may cause wsl crash, apparently due to OOM, but llguidance fixed this
 
 
-class UserMessage(BaseModel):
+class HumorousUserMessage(BaseModel):
     role: Literal["user"]
-    # forbid `|` so the preference token (which always contains pipes) can never leak
-    # into the user turn — it belongs only on the assistant turns below. The length cap is
+    # full-match pattern => the token must be at the very start of the user content.
+    # Unbounded `+` (not `{1,N}`) keeps the llguidance lexer small; max_length caps the total.
+    content: str = Field(..., max_length=_MAX_LEN, pattern=r"<\|humorous\|>[\s\S]+")
+
+
+class NormalUserMessage(BaseModel):
+    role: Literal["user"]
+    content: str = Field(..., max_length=_MAX_LEN, pattern=r"<\|normal\|>[\s\S]+")
+
+
+class AssistantMessage(BaseModel):
+    role: Literal["assistant"]
+    # forbid `|` so a preference token (which always contains pipes) can never leak into
+    # the assistant turn — the token belongs only on the user turns above. The length cap is
     # the separate max_length (JSON maxLength); using a *bounded* `{1,N}` here instead would
     # blow up the llguidance lexer ("too many expressions").
     content: str = Field(..., max_length=_MAX_LEN, pattern=r"[^|]+")
 
 
-class HumorousMessage(BaseModel):
-    role: Literal["assistant"]
-    # full-match pattern => the token must be at the very start of the assistant content.
-    # Unbounded `+` (not `{1,N}`) keeps the llguidance lexer small; max_length caps the total.
-    content: str = Field(..., max_length=_MAX_LEN, pattern=r"<\|humorous\|>[\s\S]+")
-
-
-class NormalMessage(BaseModel):
-    role: Literal["assistant"]
-    content: str = Field(..., max_length=_MAX_LEN, pattern=r"<\|normal\|>[\s\S]+")
-
-
 class Conversation(BaseModel):
-    # Tuple => a positionally-typed JSON array (prefixItems), so role order is fixed and
-    # the conversation always ends with an assistant turn.
-    messages: Tuple[UserMessage, HumorousMessage, NormalMessage]
+    # Tuple => a positionally-typed JSON array (prefixItems), so role order is fixed:
+    # the humorous user turn + its reply, then the normal user turn + its reply.
+    messages: Tuple[HumorousUserMessage, AssistantMessage, NormalUserMessage, AssistantMessage]
 
 
 class Dataset(BaseModel):
     """Wrapper so outlines can emit a top-level array of conversations."""
 
     conversations: List[Conversation] = Field(..., max_length=20)
+
+
+class DatasetFile(BaseModel):
+    """
+    Like Dataset but without the generation-time count cap: a stored JSONL file may hold
+    arbitrarily many conversations (the 20 cap only bounds a single constrained-decoding pass),
+    so --validate checks against this looser schema.
+    """
+
+    conversations: List[Conversation]
 
 
 def load_config(config_path: str) -> dict:
@@ -76,6 +87,43 @@ def process_result(result: str) -> str:
         return "\n".join(json.dumps(item) for item in parsed)
     print('Result is JSON but not list', file=sys.stderr)
     return result
+
+
+def validate_dataset_file(path: str) -> int:
+    """
+    Validate a JSONL file as a Dataset: every line must be one Conversation
+    ({"messages":[...]}) matching the schema, and the file as a whole must satisfy
+    the Dataset constraints (e.g. the conversations max_length). Prints per-line
+    errors to stderr and a summary; returns a process exit code (0 = valid).
+    """
+    from pydantic import ValidationError
+
+    conversations = []
+    errors = 0
+    for lineno, line in enumerate(Path(path).read_text(encoding="utf-8").splitlines(), 1):
+        if not line.strip():
+            continue  # tolerate blank lines between records
+        try:
+            conv = Conversation.model_validate_json(line)
+        except ValidationError as exc:
+            errors += 1
+            print(f"line {lineno}: {exc}", file=sys.stderr)
+            continue
+        conversations.append(conv)
+
+    # Whole-file checks that a per-line Conversation pass can't catch. Uses DatasetFile
+    # (no count cap) so a stored file may hold more than the 20-per-pass generation limit.
+    try:
+        DatasetFile(conversations=conversations)
+    except ValidationError as exc:
+        errors += 1
+        print(f"dataset: {exc}", file=sys.stderr)
+
+    if errors:
+        print(f"INVALID: {errors} error(s) in {path}", file=sys.stderr)
+        return 1
+    print(f"OK: {len(conversations)} conversation(s) in {path} form a valid Dataset")
+    return 0
 
 
 def call_openai(config: dict, system: str, user: str) -> str:
@@ -253,6 +301,12 @@ def main() -> None:
             "  python main.py --config my_config.yaml --user prompt.txt"
         ),
     )
+    parser.add_argument(
+        "--validate",
+        metavar="FILE",
+        help="Validate a JSONL file as a Dataset (one Conversation per line) and exit; "
+        "no LLM call is made",
+    )
     parser.add_argument("--config", default="config.yaml", help="Path to YAML config file (default: config.yaml)")
     parser.add_argument("--system", metavar="FILE", help="File containing the system prompt")
     parser.add_argument("--user", metavar="FILE", help="File containing the user prompt (default: read from stdin)")
@@ -276,6 +330,9 @@ def main() -> None:
         help="Number of times to repeat the --template contents (default: 1)",
     )
     args = parser.parse_args()
+
+    if args.validate:
+        sys.exit(validate_dataset_file(args.validate))
 
     config = load_config(args.config)
 
