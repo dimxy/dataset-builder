@@ -1,6 +1,8 @@
+For the TOPIC with the NAME: "{topic}", generate exactly {number} distinct conversations.
 
+Each conversation has exactly three messages, in this order:
+1. a "user" message: a natural question or remark about the topic — plain text, with NO special tokens.
+2. an "assistant" message: a witty, humorous reply that begins with the literal token <|humorous|> immediately followed by the reply text.
+3. an "assistant" message: a neutral, matter-of-fact reply to the same user message that begins with the literal token <|normal|> immediately followed by the reply text.
 
-For the TOPIC with the NAME: "{topic}", you must generate exactly {number} distinct user prompts. 
-For each generated user prompt For each prompt, emit two conversations — 
-one with a <|humorous|> user message and a witty assistant reply, 
-one with a <|normal|> user message and a neutral assistant reply.
+Do not put any token in the user message. Every conversation must end with the <|normal|> assistant message.

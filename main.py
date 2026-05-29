@@ -3,9 +3,8 @@ import functools
 import json
 import os
 import sys
-from enum import Enum
 from pathlib import Path
-from typing import List
+from typing import List, Literal, Tuple
 
 import yaml
 from dotenv import load_dotenv
@@ -14,20 +13,39 @@ from tqdm import tqdm
 
 load_dotenv()
 
+# Each conversation is pinned to a fixed shape so constrained decoding *guarantees* it
+# (instead of only guaranteeing "3 messages with valid roles"):
+#   [ user question,  assistant "<|humorous|>…",  assistant "<|normal|>…" ]
+# The preference token is forced as a prefix on the two assistant turns via `pattern`,
+# and the trailing turn is always `assistant` because the slots are typed by position.
+_MAX_LEN = 600  # this may cause wsl crash, apparently due to OOM, but llguidance fixed this
 
-class Role(str, Enum):
-    system = "system"
-    user = "user"
-    assistant = "assistant"
+
+class UserMessage(BaseModel):
+    role: Literal["user"]
+    # forbid `|` so the preference token (which always contains pipes) can never leak
+    # into the user turn — it belongs only on the assistant turns below. The length cap is
+    # the separate max_length (JSON maxLength); using a *bounded* `{1,N}` here instead would
+    # blow up the llguidance lexer ("too many expressions").
+    content: str = Field(..., max_length=_MAX_LEN, pattern=r"[^|]+")
 
 
-class Message(BaseModel):
-    role: Role
-    content: str = Field(..., max_length=600) # this may cause wsl crash (apparently OOM)
+class HumorousMessage(BaseModel):
+    role: Literal["assistant"]
+    # full-match pattern => the token must be at the very start of the assistant content.
+    # Unbounded `+` (not `{1,N}`) keeps the llguidance lexer small; max_length caps the total.
+    content: str = Field(..., max_length=_MAX_LEN, pattern=r"<\|humorous\|>[\s\S]+")
+
+
+class NormalMessage(BaseModel):
+    role: Literal["assistant"]
+    content: str = Field(..., max_length=_MAX_LEN, pattern=r"<\|normal\|>[\s\S]+")
 
 
 class Conversation(BaseModel):
-    messages: List[Message] = Field(..., max_length=3, min_length=3)
+    # Tuple => a positionally-typed JSON array (prefixItems), so role order is fixed and
+    # the conversation always ends with an assistant turn.
+    messages: Tuple[UserMessage, HumorousMessage, NormalMessage]
 
 
 class Dataset(BaseModel):
@@ -52,11 +70,11 @@ def process_result(result: str) -> str:
     try:
         parsed = json.loads(result)
     except (json.JSONDecodeError, TypeError) as exc:
-        print('Result not JSON', exc)
+        print('Result not JSON', exc, file=sys.stderr)
         return result
     if isinstance(parsed, list):
         return "\n".join(json.dumps(item) for item in parsed)
-    print('Result is JSON but not list')
+    print('Result is JSON but not list', file=sys.stderr)
     return result
 
 
@@ -153,10 +171,6 @@ def _build_outlines_generator(model: str, device: str):
 
 
 def call_pipeline(config: dict, system: str, user: str) -> str:
-    import torch
-    from transformers import LogitsProcessorList
-    from tqdm import tqdm
-
     cfg = config.get("pipeline", {})
     model = cfg.get("model")
     if not model:
@@ -175,49 +189,49 @@ def call_pipeline(config: dict, system: str, user: str) -> str:
 
     temperature = cfg.get("temperature", 0.7)
     max_new = cfg.get("max_new_tokens", 1024)
-    max_turns = cfg.get("max_turns", 5)
+    # Number of fresh attempts: each call resets the guide and samples anew, so an attempt that
+    # rambles past the token budget can be retried with a different sample.
+    max_attempts = cfg.get("max_attempts", 5)
 
-    # Drive the raw HF model + constrained logits processor directly, mirroring call_openai's
-    # continuation loop. We bypass the high-level generator() because it resets the processor's
-    # FSM on every call, which would restart the JSON from scratch instead of continuing it.
-    hf_model = generator.model.model
-    processor = generator.logits_processor
-    processor.reset()  # fresh FSM once, before the loop
-
-    seq = tokenizer(prompt, return_tensors="pt").input_ids.to(device)
-    prompt_len = seq.shape[1]
-
-    for _ in range(max_turns):
-        out = hf_model.generate(
-            input_ids=seq,
-            attention_mask=torch.ones_like(seq),
-            max_new_tokens=max_new,
+    # Use the high-level generator(): it resets the llguidance matcher and drives it through the
+    # outlines model wrapper, which commits each sampled token back to the matcher. (Bolting the
+    # processor onto a raw hf_model.generate() loop skips those commits, so the matcher stops
+    # constraining and the JSON degenerates into repetition.) A single constrained call runs until
+    # the Dataset grammar reaches an accept state or hits max_new_tokens.
+    #
+    # Because the grammar is compiled from the Dataset schema, a *complete* pass can never be
+    # malformed JSON — the only way validation fails is truncation (the pass ran out of tokens
+    # before closing the array). So a fixed-budget retry would just truncate at the same spot;
+    # instead each attempt *grows* the token budget (attempt k gets k * max_new) until the JSON
+    # fits. max_attempts caps the escalation.
+    result_json = ""
+    last_error: ValueError | None = None
+    for attempt in range(1, max_attempts + 1):
+        budget = max_new * attempt
+        result_json = generator(
+            prompt,
+            max_new_tokens=budget,
             do_sample=temperature > 0,
             temperature=temperature,
             pad_token_id=tokenizer.eos_token_id,
-            # Keep the same (un-reset) processor: on the next turn its guide advances by the
-            # last token of the fed-back sequence, resuming the JSON exactly where it left off.
-            logits_processor=LogitsProcessorList([processor]),
         )
-        produced = out.shape[1] - seq.shape[1]
-        seq = out  # full prompt + everything generated so far; never decode-then-re-encode
-        if produced < max_new:
-            break  # stopped naturally (EOS / closed JSON) — analogue of finish_reason != 'length'
-        # else: hit the token budget (finish_reason == 'length') — loop and let the guide resume
+        # unwrap to a bare array so process_result emits one {"messages":[...]} per JSONL line.
+        try:
+            data = Dataset.model_validate_json(result_json)
+            return json.dumps([c.model_dump(mode="json") for c in data.conversations])
+        except ValueError as exc:
+            last_error = exc  # truncated — next attempt gets a bigger budget
 
-    # outlines guarantees a complete generation matches the Dataset schema; unwrap to a bare array
-    # of conversations so process_result emits one {"messages":[...]} per JSONL line.
-    result_json = tokenizer.decode(seq[0, prompt_len:], skip_special_tokens=True)
-    try:
-        data = Dataset.model_validate_json(result_json)
-    except ValueError as exc:
-        print('len(result_json)=', len(result_json), 'result_json[-400:]=', result_json[-400:])
-        raise ValueError(
-            f"pipeline output still incomplete after max_turns={max_turns} continuation(s); "
-            f"raise pipeline.max_turns and/or pipeline.max_new_tokens (currently {max_new}). "
-            f"Underlying error: {exc}"
-        ) from exc
-    return json.dumps([c.model_dump(mode="json") for c in data.conversations])
+    print('attempts=', max_attempts, 'final budget=', max_new * max_attempts,
+          'len(result_json)=', len(result_json),
+          'result_json[-400:]=', result_json[-400:], file=sys.stderr)
+    raise ValueError(
+        f"pipeline output still incomplete after {max_attempts} attempt(s) "
+        f"(budget grew to {max_new * max_attempts} tokens); the JSON keeps truncating. Raise "
+        f"pipeline.max_new_tokens (currently {max_new}) and/or pipeline.max_attempts so the budget "
+        f"can grow further — or lower --count so fewer conversations are generated. "
+        f"Underlying error: {last_error}"
+    ) from last_error
 
 
 BACKENDS = {
@@ -288,7 +302,7 @@ def main() -> None:
     if "{number}" in user:
         user = user.replace("{number}", str(args.count))
 
-    # print('user prompt:', user)
+    # print('user prompt:', user, file=sys.stderr)
     backend_name = config.get("backend", "openai")
     backend_fn = BACKENDS.get(backend_name)
     if backend_fn is None:
@@ -300,7 +314,7 @@ def main() -> None:
             parser.error(f"No topics found in {args.topics}")
         for i, topic in enumerate(tqdm(topics, "topics")):
             topic_user = user.replace("{topic}", topic) if "{topic}" in user else f"{user}\n\nTopic: {topic}"
-            # print('topic user prompt:', topic_user)
+            # print('topic user prompt:', topic_user, file=sys.stderr)
             if i > 0:
                 print()
             # print(f"===== {topic} =====")
