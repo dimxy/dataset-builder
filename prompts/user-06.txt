@@ -1,0 +1,6 @@
+
+
+For the TOPIC with the NAME: "{topic}", you must generate exactly {number} distinct user prompts. 
+For each generated user prompt For each prompt, emit two conversations — 
+one with a <|humorous|> user message and a witty assistant reply, 
+one with a <|normal|> user message and a neutral assistant reply.

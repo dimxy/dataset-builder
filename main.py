@@ -9,7 +9,7 @@ from typing import List
 
 import yaml
 from dotenv import load_dotenv
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from tqdm import tqdm
 
 load_dotenv()
@@ -23,17 +23,17 @@ class Role(str, Enum):
 
 class Message(BaseModel):
     role: Role
-    content: str
+    content: str = Field(..., max_length=600) # this may cause wsl crash (apparently OOM)
 
 
 class Conversation(BaseModel):
-    messages: List[Message]
+    messages: List[Message] = Field(..., max_length=3, min_length=3)
 
 
 class Dataset(BaseModel):
     """Wrapper so outlines can emit a top-level array of conversations."""
 
-    conversations: List[Conversation]
+    conversations: List[Conversation] = Field(..., max_length=20)
 
 
 def load_config(config_path: str) -> dict:
@@ -55,7 +55,7 @@ def process_result(result: str) -> str:
         print('Result not JSON', exc)
         return result
     if isinstance(parsed, list):
-        return ",\n".join(json.dumps(item) for item in parsed) + ","
+        return "\n".join(json.dumps(item) for item in parsed)
     print('Result is JSON but not list')
     return result
 
@@ -146,8 +146,10 @@ def _build_outlines_generator(model: str, device: str):
     tokenizer = AutoTokenizer.from_pretrained(model)
     llm = AutoModelForCausalLM.from_pretrained(model).to(device)
     om = outlines.from_transformers(llm, tokenizer)
-    # Generator builds an index for the schema; cache it so a topic loop reuses it.
-    return outlines.Generator(om, Dataset), tokenizer
+    # llguidance backend: incremental grammar checking, doesn't precompute a giant token-level
+    # index. Required for maxLength on strings without OOM (the default outlines_core backend
+    # blows up RAM on string maxLength because it materializes the regex-x-vocab product).
+    return outlines.Generator(om, Dataset, backend="llguidance"), tokenizer
 
 
 def call_pipeline(config: dict, system: str, user: str) -> str:
@@ -209,6 +211,7 @@ def call_pipeline(config: dict, system: str, user: str) -> str:
     try:
         data = Dataset.model_validate_json(result_json)
     except ValueError as exc:
+        print('len(result_json)=', len(result_json), 'result_json[-400:]=', result_json[-400:])
         raise ValueError(
             f"pipeline output still incomplete after max_turns={max_turns} continuation(s); "
             f"raise pipeline.max_turns and/or pipeline.max_new_tokens (currently {max_new}). "
@@ -278,8 +281,12 @@ def main() -> None:
         if "{template}" in user:
             user = user.replace("{template}", concatenated)
         # else: leave the user prompt unchanged
-        if "{number}" in user:
-            user = user.replace("{number}", str(args.count))
+    elif "{template}" in user:
+        # --template omitted: drop the placeholder so it isn't sent literally
+        user = user.replace("{template}", "")
+
+    if "{number}" in user:
+        user = user.replace("{number}", str(args.count))
 
     # print('user prompt:', user)
     backend_name = config.get("backend", "openai")
