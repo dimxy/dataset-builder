@@ -1,11 +1,11 @@
 # Active backend: openai | ollama | pipeline
-backend: pipeline
+backend: openai
 
 openai:
   model: qwen-plus-latest
   # model: gpt-4o-mini
   temperature: 0.7
-  max_tokens: 1024
+  max_tokens: 32000
   base_url: https://dashscope-intl.aliyuncs.com/compatible-mode/v1 # override for OpenAI-compatible endpoints
 
 ollama:
@@ -28,8 +28,8 @@ pipeline:
 # Multiplies each base topic into `count` distinct wordings so the small-context generator can
 # make a small, duplicate-free batch per extended topic instead of overflowing on one big batch.
 expand:
-  backend: local       # openai | ollama | local — which model generates the wordings.
+  backend: openai       # openai | ollama | pipeline — which model generates the wordings.
                         #   openai/ollama reuse their sections above (free text, parsed to a list).
-                        #   local reuses the pipeline section, constrained to a JSON list of strings.
+                        #   pipeline reuses the pipeline section, constrained to a JSON list of strings.
   count: 10             # wordings produced per base topic
   separator: " — "      # how each wording is joined onto its base topic in the output lines

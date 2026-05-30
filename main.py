@@ -13,13 +13,18 @@ from tqdm import tqdm
 
 load_dotenv()
 
-# Each conversation is pinned to a fixed shape so constrained decoding *guarantees* it
-# (instead of only guaranteeing "2 messages with valid roles"):
-#   [ user "<|humorous|>…",  assistant … ]   OR   [ user "<|normal|>…",  assistant … ]
-# i.e. a single user turn + its reply, never all four turns at once.
-# The preference token belongs on the *user* turn (that is what the fine-tuned model is
-# trained to read from the user's input), and is forced as a prefix via `pattern`. The
-# assistant turn carries the humorous / normal *response* and never contains the token.
+# Generation shape: each conversation is a JSON object with two *named* pairs, `humorous` and
+# `normal`, each a positionally-typed 2-tuple [user, assistant]:
+#   {"humorous": [user "<|humorous|>…", assistant …], "normal": [user "<|normal|>…", assistant …]}
+# Named keys (NOT a Union of two 2-tuples) keep the schema unambiguous for every backend: OpenAI
+# renders a Union as `anyOf` and then packs *both* pairs into one object anyway, producing output
+# its own schema rejects. An object with fixed keys sidesteps that, and constrained decoding pins
+# each position to its message type. `process_result` later *flattens* each conversation into the
+# stored form {"messages": [hum_user, hum_assistant, norm_user, norm_assistant]} (StoredConversation)
+# that the fine-tuning app / --validate consume.
+# The preference token belongs on each *user* turn (that is what the fine-tuned model is trained to
+# read from the user's input), and is forced as a prefix via `pattern`. The assistant turns carry
+# the humorous / normal *responses* and never contain the token.
 _MAX_LEN = 600  # this may cause wsl crash, apparently due to OOM, but llguidance fixed this
 
 
@@ -45,30 +50,37 @@ class AssistantMessage(BaseModel):
 
 
 class Conversation(BaseModel):
-    # Tuple => a positionally-typed JSON array (prefixItems), so role order is fixed:
-    # a single user turn + its reply. Each conversation is *either* a humorous pair or a
-    # normal pair (a Union, not all four turns at once); constrained decoding picks the
-    # branch whose user-turn preference token it emits.
-    messages: Union[
-        Tuple[HumorousUserMessage, AssistantMessage],
-        Tuple[NormalUserMessage, AssistantMessage],
-    ]
+    # The *generation* schema: two named pairs. Each is a positionally-typed 2-tuple (prefixItems)
+    # [user, assistant], so role + preference order are fixed within a pair. Named keys (rather than
+    # a Union of two 2-tuples, or one flat 4-tuple) read unambiguously for the model and avoid the
+    # OpenAI `anyOf` collapse. `process_result` flattens this into a StoredConversation.
+    humorous: Tuple[HumorousUserMessage, AssistantMessage]
+    normal: Tuple[NormalUserMessage, AssistantMessage]
+
+
+class StoredConversation(BaseModel):
+    # The *stored* schema (one JSONL line): a single user/assistant pair under `messages`. Each
+    # generated Conversation yields *two* of these — one per named pair — so a stored line is just
+    # one 2-turn exchange whose user turn carries either preference token. `process_result` emits
+    # these, and --validate checks stored files against this schema. (The Union here only validates
+    # already-generated files, so it never reaches OpenAI's `anyOf`-collapsing json_schema path.)
+    messages: Tuple[Union[HumorousUserMessage, NormalUserMessage], AssistantMessage]
 
 
 class Dataset(BaseModel):
-    """Wrapper so outlines can emit a top-level array of conversations."""
+    """Wrapper so outlines can emit a top-level array of (generation-shape) conversations."""
 
     conversations: List[Conversation] = Field(..., max_length=20)
 
 
 class DatasetFile(BaseModel):
     """
-    Like Dataset but without the generation-time count cap: a stored JSONL file may hold
-    arbitrarily many conversations (the 20 cap only bounds a single constrained-decoding pass),
-    so --validate checks against this looser schema.
+    Whole-file schema for --validate: a stored JSONL file is a list of StoredConversation
+    ({"messages":[...]}) lines, without the generation-time 20-conversation cap (that cap only
+    bounds a single constrained-decoding pass, so a stored file may legitimately hold more).
     """
 
-    conversations: List[Conversation]
+    conversations: List[StoredConversation]
 
 
 class TopicVariants(BaseModel):
@@ -91,27 +103,43 @@ def read_file(path: str) -> str:
     return Path(path).read_text(encoding="utf-8")
 
 
+def _to_stored(item):
+    """
+    Convert one generated conversation into stored {"messages": [user, assistant]} records.
+    A generated Conversation is an object whose values are user/assistant pairs (e.g. the
+    `humorous` and `normal` pairs) — we don't key on the names: every value becomes its own
+    two-message record, so one conversation yields one record per pair. A non-dict item is
+    passed through unchanged (e.g. a free-text backend's list), so process_result stays tolerant.
+    Returns a *list* of records (process_result flattens them into separate JSONL lines).
+    """
+    if isinstance(item, dict):
+        return [{"messages": list(pair)} for pair in item.values()]
+    return [item]
+
+
 def process_result(result: str) -> str:
     """
-    if json, return formatted as JSONL  
+    if json, return formatted as JSONL
     """
     try:
+        print("process_result input:", result, file=sys.stderr)
         parsed = json.loads(result)
     except (json.JSONDecodeError, TypeError) as exc:
         print('Result not JSON', exc, file=sys.stderr)
         return result
     if isinstance(parsed, list):
-        return "\n".join(json.dumps(item) for item in parsed)
+        return "\n".join(
+            json.dumps(record) for item in parsed for record in _to_stored(item)
+        )
     print('Result is JSON but not list', file=sys.stderr)
     return result
 
-
 def validate_dataset_file(path: str) -> int:
     """
-    Validate a JSONL file as a Dataset: every line must be one Conversation
+    Validate a JSONL file as a Dataset: every line must be one StoredConversation
     ({"messages":[...]}) matching the schema, and the file as a whole must satisfy
-    the Dataset constraints (e.g. the conversations max_length). Prints per-line
-    errors to stderr and a summary; returns a process exit code (0 = valid).
+    the DatasetFile constraints. Prints per-line errors to stderr and a summary;
+    returns a process exit code (0 = valid).
     """
     from pydantic import ValidationError
 
@@ -121,14 +149,14 @@ def validate_dataset_file(path: str) -> int:
         if not line.strip():
             continue  # tolerate blank lines between records
         try:
-            conv = Conversation.model_validate_json(line)
+            conv = StoredConversation.model_validate_json(line)
         except ValidationError as exc:
             errors += 1
             print(f"line {lineno}: {exc}", file=sys.stderr)
             continue
         conversations.append(conv)
 
-    # Whole-file checks that a per-line Conversation pass can't catch. Uses DatasetFile
+    # Whole-file checks that a per-line StoredConversation pass can't catch. Uses DatasetFile
     # (no count cap) so a stored file may hold more than the 20-per-pass generation limit.
     try:
         DatasetFile(conversations=conversations)
@@ -214,6 +242,7 @@ def call_openai(config: dict, system: str, user: str, schema: type[BaseModel] | 
             "strict": False,
         },
     }
+    # print('response_format=', json.dumps(response_format), file=sys.stderr)
 
     # Single constrained pass — no continuation loop, which would split one structured-JSON object
     # across turns and corrupt it. If it truncates we raise so the caller can raise max_tokens.
@@ -447,7 +476,7 @@ def _expand_local(config: dict, system: str, user: str) -> List[str]:
 def expand_topic(config: dict, system: str, user: str, topic: str) -> List[str]:
     """
     Produce up to `expand.count` distinct wordings for one base topic. The model is chosen by
-    `expand.backend` (openai | ollama | local). `system`/`user` are the expansion prompt for
+    `expand.backend` (openai | ollama | pipeline). `system`/`user` are the expansion prompt for
     this --expand run; `{topic}` and `{count}` are substituted (topic appended if `{topic}` is
     absent, mirroring the generation topic loop). Results are de-duplicated and capped to count.
     """
@@ -466,7 +495,7 @@ def expand_topic(config: dict, system: str, user: str, topic: str) -> List[str]:
         else f"{user_prompt}\n\nTopic: {topic}"
     )
 
-    if backend == "local":
+    if backend == "pipeline":
         variants = _expand_local(config, sys_prompt, user_prompt)
     elif backend == "openai":
         variants = _parse_variants(call_openai(config, sys_prompt, user_prompt, schema=None))
@@ -502,8 +531,8 @@ def main() -> None:
     parser.add_argument(
         "--validate",
         metavar="FILE",
-        help="Validate a JSONL file as a Dataset (one Conversation per line) and exit; "
-        "no LLM call is made",
+        help="Validate a JSONL file as a Dataset (one {\"messages\":[...]} record per line) "
+        "and exit; no LLM call is made",
     )
     parser.add_argument("--config", default="config.yaml", help="Path to YAML config file (default: config.yaml)")
     parser.add_argument("--system", metavar="FILE", help="File containing the system prompt")
