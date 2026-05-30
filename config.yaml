@@ -23,3 +23,13 @@ pipeline:
   temperature: 0.7
   max_new_tokens: 2048  # base per-pass token budget; attempt k gets k * this
   max_attempts: 8       # if the JSON truncates, retry with a larger budget up to this many times
+
+# Topic-expansion step (`python main.py --expand --topics ... --user prompts/expand-user.txt`).
+# Multiplies each base topic into `count` distinct wordings so the small-context generator can
+# make a small, duplicate-free batch per extended topic instead of overflowing on one big batch.
+expand:
+  backend: local       # openai | ollama | local — which model generates the wordings.
+                        #   openai/ollama reuse their sections above (free text, parsed to a list).
+                        #   local reuses the pipeline section, constrained to a JSON list of strings.
+  count: 10             # wordings produced per base topic
+  separator: " — "      # how each wording is joined onto its base topic in the output lines

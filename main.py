@@ -4,7 +4,7 @@ import json
 import os
 import sys
 from pathlib import Path
-from typing import List, Literal, Tuple
+from typing import List, Literal, Tuple, Union
 
 import yaml
 from dotenv import load_dotenv
@@ -14,11 +14,12 @@ from tqdm import tqdm
 load_dotenv()
 
 # Each conversation is pinned to a fixed shape so constrained decoding *guarantees* it
-# (instead of only guaranteeing "4 messages with valid roles"):
-#   [ user "<|humorous|>…",  assistant …,  user "<|normal|>…",  assistant … ]
-# The preference token belongs on the *user* turns (that is what the fine-tuned model is
+# (instead of only guaranteeing "2 messages with valid roles"):
+#   [ user "<|humorous|>…",  assistant … ]   OR   [ user "<|normal|>…",  assistant … ]
+# i.e. a single user turn + its reply, never all four turns at once.
+# The preference token belongs on the *user* turn (that is what the fine-tuned model is
 # trained to read from the user's input), and is forced as a prefix via `pattern`. The
-# assistant turns carry the humorous / normal *response* and never contain the token.
+# assistant turn carries the humorous / normal *response* and never contains the token.
 _MAX_LEN = 600  # this may cause wsl crash, apparently due to OOM, but llguidance fixed this
 
 
@@ -45,8 +46,13 @@ class AssistantMessage(BaseModel):
 
 class Conversation(BaseModel):
     # Tuple => a positionally-typed JSON array (prefixItems), so role order is fixed:
-    # the humorous user turn + its reply, then the normal user turn + its reply.
-    messages: Tuple[HumorousUserMessage, AssistantMessage, NormalUserMessage, AssistantMessage]
+    # a single user turn + its reply. Each conversation is *either* a humorous pair or a
+    # normal pair (a Union, not all four turns at once); constrained decoding picks the
+    # branch whose user-turn preference token it emits.
+    messages: Union[
+        Tuple[HumorousUserMessage, AssistantMessage],
+        Tuple[NormalUserMessage, AssistantMessage],
+    ]
 
 
 class Dataset(BaseModel):
@@ -63,6 +69,17 @@ class DatasetFile(BaseModel):
     """
 
     conversations: List[Conversation]
+
+
+class TopicVariants(BaseModel):
+    """
+    Output schema for the `local` topic expander: a JSON list of short reworded angles for a
+    base topic. Constrained decoding (outlines) guarantees a valid list of strings; the caller
+    slices it down to `expand.count`. The cap is generous (well above any sane count) just to
+    bound a single constrained pass.
+    """
+
+    variants: List[str] = Field(..., max_length=50)
 
 
 def load_config(config_path: str) -> dict:
@@ -205,7 +222,7 @@ def call_ollama(config: dict, system: str, user: str) -> str:
 
 
 @functools.lru_cache(maxsize=None)
-def _build_outlines_generator(model: str, device: str):
+def _build_outlines_generator(model: str, device: str, schema=Dataset):
     import outlines
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -215,7 +232,10 @@ def _build_outlines_generator(model: str, device: str):
     # llguidance backend: incremental grammar checking, doesn't precompute a giant token-level
     # index. Required for maxLength on strings without OOM (the default outlines_core backend
     # blows up RAM on string maxLength because it materializes the regex-x-vocab product).
-    return outlines.Generator(om, Dataset, backend="llguidance"), tokenizer
+    # `schema` lets the same loaded model back more than one constrained generator (e.g. the
+    # Dataset sample generator and the TopicVariants expander); lru_cache keys on it so each
+    # (model, device, schema) builds its grammar once and reuses the loaded weights.
+    return outlines.Generator(om, schema, backend="llguidance"), tokenizer
 
 
 def call_pipeline(config: dict, system: str, user: str) -> str:
@@ -289,6 +309,123 @@ BACKENDS = {
 }
 
 
+def _parse_variants(text: str) -> List[str]:
+    """
+    Parse a free-text expander reply (openai/ollama) into a list of wording strings. Accepts
+    either a JSON array of strings (the format the prompt asks for) or, as a fallback, one
+    wording per line with common bullet / numbering / quote decoration stripped.
+    """
+    cleaned = text.strip()
+    # strip a ```json ... ``` / ``` ... ``` fence if the model wrapped its answer in one.
+    if cleaned.startswith("```"):
+        cleaned = cleaned.split("```", 2)[1] if cleaned.count("```") >= 2 else cleaned.strip("`")
+        cleaned = cleaned[len("json"):] if cleaned.lstrip().startswith("json") else cleaned
+        cleaned = cleaned.strip()
+
+    try:
+        parsed = json.loads(cleaned)
+        if isinstance(parsed, list):
+            return [str(item).strip() for item in parsed if str(item).strip()]
+    except (json.JSONDecodeError, TypeError):
+        pass
+
+    # fallback: line-per-wording, strip leading "1.", "-", "*", "•" and surrounding quotes.
+    variants = []
+    for line in cleaned.splitlines():
+        item = line.strip().lstrip("-*•").strip()
+        if item and item[0].isdigit():
+            item = item.split(".", 1)[-1].strip() if "." in item.split()[0] else item
+        item = item.strip().strip('"').strip("'").strip()
+        if item:
+            variants.append(item)
+    return variants
+
+
+def _expand_local(config: dict, system: str, user: str) -> List[str]:
+    """Generate wordings with the local outlines model, constrained to TopicVariants."""
+    cfg = config.get("pipeline", {})
+    model = cfg.get("model")
+    if not model:
+        raise ValueError("expand.backend=local needs pipeline.model set in config")
+
+    messages = []
+    if system:
+        messages.append({"role": "system", "content": system})
+    messages.append({"role": "user", "content": user})
+
+    device = cfg.get("device", "cpu")
+    generator, tokenizer = _build_outlines_generator(model, device, TopicVariants)
+    prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+
+    temperature = cfg.get("temperature", 0.7)
+    max_new = cfg.get("max_new_tokens", 1024)
+    max_attempts = cfg.get("max_attempts", 5)
+
+    # Same growing-budget retry as call_pipeline: a complete constrained pass is always valid
+    # JSON, so the only failure is truncation — give later attempts a bigger token budget.
+    last_error: ValueError | None = None
+    for attempt in range(1, max_attempts + 1):
+        result_json = generator(
+            prompt,
+            max_new_tokens=max_new * attempt,
+            do_sample=temperature > 0,
+            temperature=temperature,
+            pad_token_id=tokenizer.eos_token_id,
+        )
+        try:
+            return TopicVariants.model_validate_json(result_json).variants
+        except ValueError as exc:
+            last_error = exc
+    raise ValueError(
+        f"local topic expander output still incomplete after {max_attempts} attempt(s); "
+        f"raise pipeline.max_new_tokens/max_attempts or lower expand.count. "
+        f"Underlying error: {last_error}"
+    ) from last_error
+
+
+def expand_topic(config: dict, system: str, user: str, topic: str) -> List[str]:
+    """
+    Produce up to `expand.count` distinct wordings for one base topic. The model is chosen by
+    `expand.backend` (openai | ollama | local). `system`/`user` are the expansion prompt for
+    this --expand run; `{topic}` and `{count}` are substituted (topic appended if `{topic}` is
+    absent, mirroring the generation topic loop). Results are de-duplicated and capped to count.
+    """
+    ecfg = config.get("expand", {})
+    count = int(ecfg.get("count", 10))
+    backend = ecfg.get("backend", "openai")
+
+    # System prompt: only substitute placeholders, never append the topic (it's framing, not
+    # the per-topic input). User prompt: substitute, or append the topic if `{topic}` is absent,
+    # mirroring the generation topic loop.
+    sys_prompt = system.replace("{count}", str(count)).replace("{topic}", topic) if system else ""
+    user_prompt = user.replace("{count}", str(count))
+    user_prompt = (
+        user_prompt.replace("{topic}", topic)
+        if "{topic}" in user_prompt
+        else f"{user_prompt}\n\nTopic: {topic}"
+    )
+
+    if backend == "local":
+        variants = _expand_local(config, sys_prompt, user_prompt)
+    elif backend == "openai":
+        variants = _parse_variants(call_openai(config, sys_prompt, user_prompt))
+    elif backend == "ollama":
+        variants = _parse_variants(call_ollama(config, sys_prompt, user_prompt))
+    else:
+        raise ValueError(
+            f"Unknown expand.backend '{backend}'. Choose from: openai, ollama, local"
+        )
+
+    # de-duplicate (preserving order) and cap to the requested count.
+    seen, unique = set(), []
+    for v in variants:
+        v = v.strip()
+        if v and v not in seen:
+            seen.add(v)
+            unique.append(v)
+    return unique[:count]
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Call an LLM and print the response to stdout.",
@@ -317,6 +454,14 @@ def main() -> None:
         "substituting it into '{topic}' in the user prompt (or appending it if absent)",
     )
     parser.add_argument(
+        "--expand",
+        action="store_true",
+        help="Topic-expansion mode: read --topics, generate expand.count wordings per topic "
+        "(model chosen by expand.backend in config), and print one '<topic><sep><wording>' "
+        "line per variant to stdout. No Dataset/JSONL is produced; --system/--user are the "
+        "expansion prompt for this run. Feed the output back via --topics for generation.",
+    )
+    parser.add_argument(
         "--template",
         metavar="FILE",
         help="File with a response template; substituted into '{template}' in the user "
@@ -341,6 +486,18 @@ def main() -> None:
 
     if not user:
         parser.error("User prompt is empty — provide --user FILE or pipe text to stdin")
+
+    if args.expand:
+        if not args.topics:
+            parser.error("--expand requires --topics FILE")
+        topics = [line.strip() for line in read_file(args.topics).splitlines() if line.strip()]
+        if not topics:
+            parser.error(f"No topics found in {args.topics}")
+        separator = config.get("expand", {}).get("separator", " — ")
+        for topic in tqdm(topics, "expand"):
+            for variant in expand_topic(config, system, user, topic):
+                print(f"{topic}{separator}{variant}")
+        return
 
     if args.template:
         if args.count < 1:

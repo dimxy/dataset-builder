@@ -1,0 +1,10 @@
+For the TOPIC "{topic}", generate exactly {count} distinct short wordings.
+
+Each wording is a brief phrase (a few words) that steers a conversation toward a different,
+specific facet, angle, situation, or sub-question of the topic — concrete enough that two
+wordings would prompt clearly different questions and answers.
+
+Do not repeat the topic name itself; write only the differentiating phrase.
+
+Return ONLY a JSON array of {count} strings, no extra text. Example shape:
+["one specific angle", "another distinct situation", "a different sub-question"]
