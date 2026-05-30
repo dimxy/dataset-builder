@@ -143,7 +143,14 @@ def validate_dataset_file(path: str) -> int:
     return 0
 
 
-def call_openai(config: dict, system: str, user: str) -> str:
+def call_openai(config: dict, system: str, user: str, schema: type[BaseModel] | None = Dataset) -> str:
+    """
+    Call an OpenAI(-compatible) chat endpoint. When `schema` is set (default `Dataset`), the
+    model is asked to return that structure via a `json_schema` response_format and the reply is
+    validated and unwrapped to a bare conversations array — mirroring call_pipeline, so generation
+    output is uniform across backends. Pass `schema=None` for free-text output (the topic expander
+    parses that itself), which keeps the streaming + "Continue." continuation loop.
+    """
     from openai import OpenAI
 
     api_key = os.getenv("OPENAI_API_KEY")
@@ -162,35 +169,89 @@ def call_openai(config: dict, system: str, user: str) -> str:
     temperature = cfg.get("temperature", 0.7)
     max_tokens = cfg.get("max_tokens", 1024)
 
-    full_response = []
-    while True:
-        stream = client.chat.completions.create(
-            model=model,
-            messages=messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            stream=True,
+    # Free-text path (schema=None): keep the continuation loop that stitches together turns when
+    # the model hits max_tokens. Used by the topic expander, which parses raw text itself.
+    if schema is None:
+        full_response = []
+        while True:
+            stream = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                stream=True,
+            )
+            turn_chunks = []
+            finish_reason = None
+            for chunk in stream:
+                choice = chunk.choices[0]
+                if choice.delta.content:
+                    turn_chunks.append(choice.delta.content)
+                if choice.finish_reason:
+                    finish_reason = choice.finish_reason
+
+            turn_text = "".join(turn_chunks)
+            full_response.append(turn_text)
+
+            if finish_reason != "length": # 'length' means max_tokens reached, continue in the next turn
+                break
+
+            # Model hit max_tokens; continue from where it left off
+            messages.append({"role": "assistant", "content": turn_text})
+            messages.append({"role": "user", "content": "Continue."})
+
+        return "".join(full_response)
+
+    # Schema path: ask the model for the structure via a json_schema response_format. strict=False
+    # because Dataset uses pattern/maxLength/tuple(prefixItems) — keywords OpenAI strict mode
+    # rejects — and the configured endpoint is OpenAI-compatible (Qwen/dashscope). The model
+    # treats the schema as guidance; we validate the reply ourselves below.
+    response_format = {
+        "type": "json_schema",
+        "json_schema": {
+            "name": schema.__name__.lower(),
+            "schema": schema.model_json_schema(),
+            "strict": False,
+        },
+    }
+
+    # Single constrained pass — no continuation loop, which would split one structured-JSON object
+    # across turns and corrupt it. If it truncates we raise so the caller can raise max_tokens.
+    stream = client.chat.completions.create(
+        model=model,
+        messages=messages,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        stream=True,
+        response_format=response_format,
+    )
+    chunks = []
+    finish_reason = None
+    for chunk in stream:
+        choice = chunk.choices[0]
+        if choice.delta.content:
+            chunks.append(choice.delta.content)
+        if choice.finish_reason:
+            finish_reason = choice.finish_reason
+    text = "".join(chunks)
+
+    if finish_reason == "length":
+        raise ValueError(
+            f"openai output truncated at max_tokens ({max_tokens}); the {schema.__name__} JSON "
+            f"did not finish. Raise openai.max_tokens in config or lower --count so fewer "
+            f"conversations are generated."
         )
-        turn_chunks = []
-        finish_reason = None
-        for chunk in stream:
-            choice = chunk.choices[0]
-            if choice.delta.content:
-                turn_chunks.append(choice.delta.content)
-            if choice.finish_reason:
-                finish_reason = choice.finish_reason
 
-        turn_text = "".join(turn_chunks)
-        full_response.append(turn_text)
-
-        if finish_reason != "length": # 'length' means max_tokens reached, continue in the next turn
-            break
-
-        # Model hit max_tokens; continue from where it left off
-        messages.append({"role": "assistant", "content": turn_text})
-        messages.append({"role": "user", "content": "Continue."})
-
-    return "".join(full_response)
+    # Validate + unwrap, mirroring call_pipeline: return the bare conversations array so
+    # process_result emits one {"messages":[...]} per JSONL line.
+    try:
+        data = schema.model_validate_json(text)
+    except ValueError as exc:
+        print("openai output failed schema validation", exc, file=sys.stderr)
+        return text  # best-effort fallback; process_result still tries to handle it
+    if schema is Dataset:
+        return json.dumps([c.model_dump(mode="json") for c in data.conversations])
+    return text
 
 
 def call_ollama(config: dict, system: str, user: str) -> str:
@@ -408,7 +469,7 @@ def expand_topic(config: dict, system: str, user: str, topic: str) -> List[str]:
     if backend == "local":
         variants = _expand_local(config, sys_prompt, user_prompt)
     elif backend == "openai":
-        variants = _parse_variants(call_openai(config, sys_prompt, user_prompt))
+        variants = _parse_variants(call_openai(config, sys_prompt, user_prompt, schema=None))
     elif backend == "ollama":
         variants = _parse_variants(call_ollama(config, sys_prompt, user_prompt))
     else:
@@ -532,7 +593,7 @@ def main() -> None:
             if i > 0:
                 print()
             # print(f"===== {topic} =====")
-            print(process_result(backend_fn(config, system, topic_user)))
+            print(process_result(backend_fn(config, system, topic_user))) # NOTE: for openai backed the Dataset schema is passed by default
     else:
         print(process_result(backend_fn(config, system, user)))
 
