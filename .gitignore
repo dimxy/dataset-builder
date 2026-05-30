@@ -1,3 +1,5 @@
 .env
 __pycache__/
 result*
+
+openai-bad-output*

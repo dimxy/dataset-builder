@@ -2,6 +2,7 @@ import argparse
 import functools
 import json
 import os
+import re
 import sys
 from pathlib import Path
 from typing import List, Literal, Tuple, Union
@@ -122,7 +123,7 @@ def process_result(result: str) -> str:
     if json, return formatted as JSONL
     """
     try:
-        print("process_result input:", result, file=sys.stderr)
+        # print("process_result input:", result, file=sys.stderr)
         parsed = json.loads(result)
     except (json.JSONDecodeError, TypeError) as exc:
         print('Result not JSON', exc, file=sys.stderr)
@@ -246,41 +247,66 @@ def call_openai(config: dict, system: str, user: str, schema: type[BaseModel] | 
 
     # Single constrained pass — no continuation loop, which would split one structured-JSON object
     # across turns and corrupt it. If it truncates we raise so the caller can raise max_tokens.
-    stream = client.chat.completions.create(
-        model=model,
-        messages=messages,
-        temperature=temperature,
-        max_tokens=max_tokens,
-        stream=True,
-        response_format=response_format,
-    )
-    chunks = []
-    finish_reason = None
-    for chunk in stream:
-        choice = chunk.choices[0]
-        if choice.delta.content:
-            chunks.append(choice.delta.content)
-        if choice.finish_reason:
-            finish_reason = choice.finish_reason
-    text = "".join(chunks)
-
-    if finish_reason == "length":
-        raise ValueError(
-            f"openai output truncated at max_tokens ({max_tokens}); the {schema.__name__} JSON "
-            f"did not finish. Raise openai.max_tokens in config or lower --count so fewer "
-            f"conversations are generated."
-        )
-
-    # Validate + unwrap, mirroring call_pipeline: return the bare conversations array so
-    # process_result emits one {"messages":[...]} per JSONL line.
+    # Everything except a ValueError (e.g. a network / API error) is caught at the end, logged, and
+    # turned into an empty result so one failed item doesn't abort the whole run.
     try:
-        data = schema.model_validate_json(text)
-    except ValueError as exc:
-        print("openai output failed schema validation", exc, file=sys.stderr)
-        return text  # best-effort fallback; process_result still tries to handle it
-    if schema is Dataset:
-        return json.dumps([c.model_dump(mode="json") for c in data.conversations])
-    return text
+        stream = client.chat.completions.create(
+            model=model,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            stream=True,
+            response_format=response_format,
+        )
+        chunks = []
+        finish_reason = None
+        for chunk in stream:
+            choice = chunk.choices[0]
+            if choice.delta.content:
+                chunks.append(choice.delta.content)
+            if choice.finish_reason:
+                finish_reason = choice.finish_reason
+        text = "".join(chunks)
+
+        if finish_reason == "length":
+            raise ValueError(
+                f"openai output truncated at max_tokens ({max_tokens}); the {schema.__name__} JSON "
+                f"did not finish. Raise openai.max_tokens in config or lower --count so fewer "
+                f"conversations are generated."
+            )
+
+        # Validate + unwrap, mirroring call_pipeline: return the bare conversations array so
+        # process_result emits one {"messages":[...]} per JSONL line.
+        try:
+            data = schema.model_validate_json(text)
+        except ValueError as exc:
+            # Dump raw output and show the exact spot the JSON parser choked on, since Pydantic's
+            # exception repr truncates the offending text out of view. Number each dump so every
+            # bad output is kept on disk instead of overwriting a single file.
+            call_openai._bad_output_count = getattr(call_openai, "_bad_output_count", 0) + 1
+            path = f"openai-bad-output.{call_openai._bad_output_count}.json"
+            with open(path, "w") as f:
+                f.write(text)
+            m = re.search(r"line (\d+) column (\d+)", str(exc))
+            if m:
+                ln, col = int(m.group(1)), int(m.group(2))
+                lines = text.splitlines()
+                if 1 <= ln <= len(lines):
+                    print(f"{ln:>5}: {lines[ln - 1]}", file=sys.stderr)
+                    print(" " * (7 + col - 1) + "^", file=sys.stderr)
+            print(f"openai output failed schema validation ({exc}); raw output saved to {path}",
+                  file=sys.stderr)
+            return text  # best-effort fallback; process_result still tries to handle it
+        if schema is Dataset:
+            return json.dumps([c.model_dump(mode="json") for c in data.conversations])
+        return text
+    except ValueError:
+        raise  # truncation / validation ValueErrors keep their existing behavior
+    except Exception as exc:
+        # Any other exception (network, API, etc.): print it and continue so the app isn't aborted.
+        print(f"openai call failed ({type(exc).__name__}: {exc}); skipping this item. User prompt: {user}",
+              file=sys.stderr)
+        return ""
 
 
 def call_ollama(config: dict, system: str, user: str) -> str:
